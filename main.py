@@ -3,7 +3,9 @@ import io
 import logging
 import math
 import os
+import random
 import re
+import time
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
@@ -276,64 +278,69 @@ def segundos_de_espera(erro_api) -> Optional[float]:
     )
 
 
+PRAZO_TOTAL_SEG = 55
+ESPERA_ENTRE_RODADAS_SEG = 5
+
+
 async def chamar_com_reserva(
     jpeg: bytes,
 ) -> tuple[LeituraGemini, bool]:
     """
-    Tenta o modelo principal e depois o modelo de contingência.
+    Tenta o modelo principal e o de contingência, em até duas rodadas, com uma
+    pausa entre elas (o erro 503 do Gemini costuma durar só alguns segundos).
     Retorna a leitura e um indicador de contingência.
     """
-    try:
-        return await chamar_gemini(
-            MODELO_PRINCIPAL,
-            jpeg,
-        ), False
+    tentativas = [
+        (MODELO_PRINCIPAL, False),
+        (MODELO_FALLBACK, True),
+        (MODELO_PRINCIPAL, False),
+        (MODELO_FALLBACK, True),
+    ]
 
-    except errors.APIError as e:
-        if e.code not in (429, 503):
-            raise
+    inicio = time.monotonic()
+    ultimo_erro = None
 
-        log.warning(
-            "Modelo principal indisponível (%s). "
-            "Tentando contingência.",
-            e.code,
-        )
+    for i, (modelo, contingencia) in enumerate(tentativas):
+        try:
+            return await chamar_gemini(modelo, jpeg), contingencia
 
-    try:
-        return await chamar_gemini(
-            MODELO_FALLBACK,
-            jpeg,
-        ), True
+        except errors.APIError as e:
+            if e.code not in (429, 503):
+                raise
 
-    except errors.APIError as e:
-        if e.code not in (429, 503):
-            raise
+            ultimo_erro = e
 
-        ultimo_erro = e
+            log.warning(
+                "Modelo %s indisponível (%s). Tentativa %d de %d.",
+                modelo,
+                e.code,
+                i + 1,
+                len(tentativas),
+            )
 
-    espera = segundos_de_espera(ultimo_erro)
+        espera = segundos_de_espera(ultimo_erro)
 
-    if espera is None:
-        espera = 20
+        # Limite longo (ex.: cota diária): esperar não adianta.
+        # Só tenta o outro modelo uma vez e desiste.
+        if espera is not None and espera > 45:
+            if i >= 1:
+                raise ultimo_erro
+            continue
 
-    # Não aguarda automaticamente por limites longos,
-    # como os limites diários.
-    if espera > 45:
-        raise ultimo_erro
+        # Fim de uma rodada (principal + contingência): faz uma pausa.
+        if i == 1:
+            pausa = min(espera if espera is not None else ESPERA_ENTRE_RODADAS_SEG, 20)
+            pausa += random.uniform(0, 2)
 
-    log.warning(
-        "Contingência indisponível (%s). "
-        "Nova tentativa em %.0f segundos.",
-        ultimo_erro.code,
-        espera,
-    )
+            if time.monotonic() - inicio + pausa > PRAZO_TOTAL_SEG:
+                raise ultimo_erro
 
-    await asyncio.sleep(espera + 1)
+            await asyncio.sleep(pausa)
 
-    return await chamar_gemini(
-        MODELO_PRINCIPAL,
-        jpeg,
-    ), False
+        if time.monotonic() - inicio > PRAZO_TOTAL_SEG:
+            raise ultimo_erro
+
+    raise ultimo_erro
 
 
 @app.get("/health")
